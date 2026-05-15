@@ -1,12 +1,5 @@
 # Hermes Agent ReAct 机制
 
-> **文档版本**：v1.0  
-> **整理时间**：2026-04-24  
-> **代码基准**：hermes-agent main branch  
-> **核心文件**：`run_agent.py`、`model_tools.py`、`tools/registry.py`、`agent/prompt_builder.py`、`agent/context_compressor.py`
-
----
-
 ## 一、概述
 
 **Hermes Agent** 是由 Nous Research 开发的开源 AI Agent 框架，其核心实现了 **ReAct（Reasoning + Acting）** 范式——即让 LLM 在"推理"与"行动"之间交替循环，直到任务完成。整个系统以 `run_agent.py` 中的 `AIAgent` 类为核心，通过 `run_conversation()` 方法驱动完整的 ReAct 循环。
@@ -19,46 +12,20 @@
                                     └── No  → 输出最终响应，结束
 ```
 
----
+Hermes 的 ReAct 实现相比朴素循环增加了**四个关键机制**：
 
-## 二、整体架构
-
-### 2.1 核心文件与 ReAct 阶段映射
-
-ReAct 循环由以下模块协作完成，每个模块对应循环中的特定阶段：
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ReAct 主循环（run_agent.py）                   │
-│                                                                 │
-│  ① Reason 阶段                    ② Act 阶段                    │
-│  ┌────────────────────┐           ┌────────────────────────┐   │
-│  │ prompt_builder.py  │ ──构建──▶ │  LLM API 调用          │   │
-│  │ （组装 System      │           │  （model_tools.py）    │   │
-│  │   Prompt）         │           │   ↓ 返回 tool_calls    │   │
-│  │ context_compressor │           │  handle_function_call  │   │
-│  │ （裁剪上下文）     │           │   → tools/registry.py  │   │
-│  └────────────────────┘           │   → tools/*.py 执行    │   │
-│                                   └────────────────────────┘   │
-│                  ③ 工具结果追加到 messages → 回到 ①             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-| ReAct 阶段 | 模块 | 职责 |
-|---|---|---|
-| **初始化** | `agent/prompt_builder.py` | 组装 System Prompt（身份、记忆、技能、上下文文件） |
-| **Reason 前置** | `agent/context_compressor.py` | 裁剪过长上下文，防止超出窗口 |
-| **Reason** | `run_agent.py` → LLM | 调用大模型，获得推理结果（含 tool_calls 或最终回复） |
-| **Act 分发** | `model_tools.py` | 从 tool_calls 解析函数名，调用 `handle_function_call()` |
-| **Act 执行** | `tools/registry.py` + `tools/*.py` | 注册中心查找 handler，执行具体工具，返回结果 |
-| **循环回写** | `run_agent.py` | 将工具结果追加到 messages，驱动下一轮 Reason |
-| **入口** | `cli.py` / `gateway/run.py` | CLI 交互层 / 消息平台网关，触发 `run_conversation()` |
+| 机制 | 解决的问题 | 位置 |
+|------|-----------|------|
+| **迭代预算** | 防止无限循环 | `IterationBudget` 线程安全计数器 + Grace Call |
+| **上下文压缩** | 防止上下文溢出 | `ContextCompressor` 自动摘要中间轮次 |
+| **工具护栏** | 防止重复失败/无进展循环 | `ToolCallGuardrailController` 检测并阻断 |
+| **Steer** | 中途引导而不中断 | `/steer` 注入到工具结果，不破坏消息序列 |
 
 ---
 
-## 三、ReAct 主循环实现
+## 二、ReAct 主循环实现
 
-### 3.1 `run_conversation()` 整体流程
+### 2.1 `run_conversation()` 整体流程
 
 ```
 用户输入
@@ -112,7 +79,7 @@ ReAct 循环由以下模块协作完成，每个模块对应循环中的特定�
 - `messages` 始终是"干净"的对话历史，可持久化、可复现
 - System Prompt 保持稳定，Anthropic prefix cache 跨轮命中
 
-### 3.2 核心循环代码结构
+### 2.2 核心循环代码结构
 
 > 源码：`run_agent.py`，行号标注对应实际位置，便于源码定位。
 
@@ -161,11 +128,50 @@ while (api_call_count < self.max_iterations
         break
 ```
 
+### 2.3 迭代预算（IterationBudget）
+
+线程安全的迭代计数器，防止无限循环：
+
+```python
+class IterationBudget:
+    def consume() -> bool    # 消耗一次迭代，返回是否允许
+    def refund()             # 退还一次（execute_code 等编程式调用）
+    @property remaining      # 剩余次数（线程安全）
+```
+
+- 默认 `max_iterations=90`（父 Agent）
+- 子 Agent 独立预算（默认 50，通过 `delegation.max_iterations` 配置）
+- 预算耗尽时注入一条提示消息，给模型最后一次机会输出文本响应（**Grace Call** 机制）
+
+### 2.4 上下文压缩（Context Compression）
+
+当对话历史接近模型上下文窗口阈值（默认 50%）时，`ContextCompressor` 自动压缩：
+
+```
+压缩算法（ContextCompressor）：
+1. 预剪枝：将旧工具输出替换为单行摘要（无 LLM 调用，纯规则）
+   - [terminal] ran `npm test` -> exit 0, 47 lines output
+   - [read_file] read config.py from line 1 (1,200 chars)
+   - ...
+2. 保护头部：系统提示 + 前 N 条消息（protect_first_n=3）
+3. 保护尾部：最近 ~20K tokens 的消息（protect_last_n=20）
+4. LLM 摘要：用辅助模型（cheap/fast，如 Gemini Flash）摘要中间轮次
+5. 迭代更新：多次压缩时，在前次摘要基础上增量更新
+```
+
+**摘要模板**包含结构化字段：
+- `## Resolved Questions`：已解决的问题
+- `## Active Task`：当前活跃任务（Agent 从此处恢复）
+- `## Key Findings`：关键发现
+- `## Remaining Work`：剩余工作
+
+**关键约束**：压缩是**唯一允许修改历史上下文**的时机，其他任何操作均不得改变已有消息（保护 Prompt Caching 有效性）。
+
 ---
 
-## 四、Reason 阶段：LLM 推理
+## 三、Reason 阶段：LLM 推理
 
-### 4.1 多 API 模式支持
+### 3.1 多 API 模式支持
 
 Hermes Agent 支持四种 LLM API 模式，通过 `api_mode` 字段统一路由：
 
@@ -176,7 +182,7 @@ Hermes Agent 支持四种 LLM API 模式，通过 `api_mode` 字段统一路由�
 | `codex_responses` | OpenAI Responses API | GPT-5.x 系列，支持加密推理链（encrypted reasoning） |
 | `bedrock_converse` | AWS Bedrock | boto3 直接调用，支持 Guardrail |
 
-### 4.2 流式推理（Streaming）
+### 3.2 流式推理（Streaming）
 
 所有 API 调用均采用**流式输出**，通过独立线程执行，主线程轮询结果：
 
@@ -201,7 +207,7 @@ while t.is_alive():
 | `tool_start_callback` | 工具开始执行 | 进度通知 |
 | `tool_complete_callback` | 工具执行完成 | 结果通知 |
 
-### 4.3 System Prompt 构建
+### 3.3 System Prompt 构建
 
 System Prompt 由 `_build_system_prompt()` 组装，**每个 Session 只构建一次**（缓存在 `_cached_system_prompt`），以保证 Anthropic Prompt Caching 的前缀一致性：
 
@@ -221,7 +227,7 @@ System Prompt 组成（按顺序拼接）：
 12. 平台 Hints               ← WhatsApp/Telegram/Slack 等平台特定指令
 ```
 
-### 4.4 工具使用强制指令（Tool-Use Enforcement）
+### 3.4 工具使用强制指令（Tool-Use Enforcement）
 
 针对不同模型家族，注入专项执行纪律提示，防止模型"只说不做"：
 
@@ -236,9 +242,9 @@ System Prompt 组成（按顺序拼接）：
 
 ---
 
-## 五、Act 阶段：工具执行
+## 四、Act 阶段：工具执行
 
-### 5.1 工具注册体系
+### 4.1 工具注册体系
 
 工具通过 `ToolRegistry` 单例管理，每个工具文件在 import 时自动注册：
 
@@ -256,7 +262,7 @@ registry.register(
 
 **自动发现机制**：`discover_builtin_tools()` 通过 **AST 静态分析**扫描 `tools/*.py`，找到包含顶层 `registry.register()` 调用的文件并动态 import，无需手动维护工具列表。
 
-### 5.2 工具分发链
+### 4.2 工具分发链
 
 ```
 run_agent._execute_tool_calls()
@@ -290,7 +296,7 @@ run_agent._execute_tool_calls()
 - `execute_code`（沙箱代码执行）
 - MCP 工具（外部 MCP Server 动态注册）
 
-### 5.3 并发工具执行
+### 4.3 并发工具执行
 
 ```python
 # 并发安全分类
@@ -306,203 +312,13 @@ _PATH_SCOPED_TOOLS = frozenset({                       # 路径无冲突时并�
 
 并发结果按**原始工具调用顺序**收集后追加到 messages，保证 API 消息序列的正确性。
 
-### 5.4 工具结果大小控制
+### 4.4 工具结果大小控制
 
 工具结果过大时，`maybe_persist_tool_result()` 自动将结果写入临时文件，返回文件路径引用，防止上下文窗口被单个工具结果撑爆。`enforce_turn_budget()` 在每轮工具执行后检查总结果大小。
 
 ---
 
-## 六、上下文管理
-
-### 6.1 迭代预算（IterationBudget）
-
-线程安全的迭代计数器，防止无限循环：
-
-```python
-class IterationBudget:
-    def consume() -> bool    # 消耗一次迭代，返回是否允许
-    def refund()             # 退还一次（execute_code 等编程式调用）
-    @property remaining      # 剩余次数（线程安全）
-```
-
-- 默认 `max_iterations=90`（父 Agent）
-- 子 Agent 独立预算（默认 50，通过 `delegation.max_iterations` 配置）
-- 预算耗尽时注入一条提示消息，给模型最后一次机会输出文本响应（**Grace Call** 机制）
-
-### 6.2 上下文压缩（Context Compression）
-
-当对话历史接近模型上下文窗口阈值（默认 50%）时，`ContextCompressor` 自动压缩：
-
-```
-压缩算法（ContextCompressor）：
-1. 预剪枝：将旧工具输出替换为单行摘要（无 LLM 调用，纯规则）
-   - [terminal] ran `npm test` -> exit 0, 47 lines output
-   - [read_file] read config.py from line 1 (1,200 chars)
-   - ...
-2. 保护头部：系统提示 + 前 N 条消息（protect_first_n=3）
-3. 保护尾部：最近 ~20K tokens 的消息（protect_last_n=20）
-4. LLM 摘要：用辅助模型（cheap/fast，如 Gemini Flash）摘要中间轮次
-5. 迭代更新：多次压缩时，在前次摘要基础上增量更新
-```
-
-**摘要模板**包含结构化字段：
-- `## Resolved Questions`：已解决的问题
-- `## Active Task`：当前活跃任务（Agent 从此处恢复）
-- `## Key Findings`：关键发现
-- `## Remaining Work`：剩余工作
-
-**关键约束**：压缩是**唯一允许修改历史上下文**的时机，其他任何操作均不得改变已有消息（保护 Prompt Caching 有效性）。
-
-### 6.3 Prompt Caching
-
-对 Claude 模型（OpenRouter + 原生 Anthropic）自动启用 Anthropic Prompt Caching：
-
-| 配置项 | 值 |
-|--------|-----|
-| 策略 | `system_and_3`（4 个缓存断点） |
-| TTL | 5 分钟（1.25x 写入成本） |
-| 节省 | 多轮对话节省 ~75% 输入成本 |
-| 约束 | System Prompt 在整个 Session 内保持不变 |
-
----
-
-## 七、子 Agent 委派（Hierarchical ReAct）
-
-### 7.1 架构设计
-
-`delegate_task` 工具允许父 Agent 将子任务委派给独立的子 Agent，实现**层级化 ReAct**：
-
-```
-父 Agent (depth=0, max_iterations=90)
-    │
-    ├── delegate_task(goal="子任务A", toolsets=["terminal","file"])
-    │       └── 子 Agent A (depth=1, max_iterations=50, 独立上下文, 独立 task_id)
-    │
-    └── delegate_task(tasks=[...])  # 批量并行委派
-            ├── 子 Agent B (ThreadPoolExecutor, max_concurrent=3)
-            └── 子 Agent C (ThreadPoolExecutor)
-```
-
-### 7.2 子 Agent 约束
-
-```python
-DELEGATE_BLOCKED_TOOLS = frozenset([
-    "delegate_task",   # 禁止递归委派（最大深度 MAX_DEPTH=2）
-    "clarify",         # 禁止用户交互
-    "memory",          # 禁止写共享记忆（防止并发写冲突）
-    "send_message",    # 禁止跨平台副作用
-    "execute_code",    # 子 Agent 应逐步推理，不写脚本
-])
-```
-
-- 子 Agent 拥有**独立的对话历史**（无父 Agent 上下文）
-- 子 Agent 拥有**独立的 terminal session**（`task_id` 隔离）
-- 父 Agent 只看到委派调用和最终摘要结果，**不看中间步骤**
-- 中断信号从父 Agent 递归传播到所有子 Agent
-
----
-
-## 八、容错与恢复机制
-
-### 8.1 Provider 故障转移链
-
-```
-主 Provider 失败
-    │
-    ├── 1. 凭证轮换（Credential Pool Rotation）
-    │      └── 同 Provider 多 API Key 轮换
-    │
-    ├── 2. 主 Provider 传输恢复（Transport Recovery）
-    │      └── 重建 httpx 连接池，再试一次
-    │      └── 仅对传输层错误（ReadTimeout、ConnectError 等）
-    │
-    └── 3. Fallback Chain 激活
-           └── 按序尝试备用 Provider（config.yaml 配置）
-               每轮结束后自动恢复主 Provider（turn-scoped fallback）
-```
-
-### 8.2 流式连接恢复
-
-| 机制 | 触发条件 | 处理方式 |
-|------|----------|----------|
-| Stale Stream 检测 | 超过 180s 无 chunk | 重建连接，重试 |
-| 流式重试 | 连接错误（未发送任何 token） | 最多 2 次重试 |
-| 本地 Provider | Ollama 等大上下文 prefill | 自动禁用 Stale 检测 |
-| 部分交付保护 | 已发送 token 后失败 | 不重试，直接上报错误 |
-
-### 8.3 消息完整性保护
-
-`_sanitize_api_messages()` 在每次 API 调用前运行，修复孤立的 tool call/result 对：
-
-1. 过滤非法 role 的消息（allowlist 校验）
-2. 删除孤立的 tool result（无对应 assistant tool_call）
-3. 为缺失 result 的 tool_call 注入 stub 占位消息
-
-### 8.4 中断机制
-
-```python
-# 从任意线程调用（CLI 输入线程、Gateway 消息接收线程）
-agent.interrupt(message)
-    │
-    ├── 设置 _interrupt_requested = True
-    ├── 向执行线程发送工具级中断信号（_set_interrupt，线程作用域）
-    └── 递归传播到所有子 Agent（_active_children）
-```
-
-循环在每次迭代开始和每个工具执行前检查中断标志，确保快速响应。
-
----
-
-## 九、架构总结图
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                          AIAgent                                │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                   run_conversation()                      │  │
-│  │                                                           │  │
-│  │  System Prompt (Session 级缓存，不可变)                    │  │
-│  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │ Identity + Memory + Skills Index + Context Files   │  │  │
-│  │  └────────────────────────────────────────────────────┘  │  │
-│  │                                                           │  │
-│  │  ReAct Loop (max 90 iterations, IterationBudget)          │  │
-│  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │                                                    │  │  │
-│  │  │  [Reason] ──→ LLM API Call (streaming, 4 modes)   │  │  │
-│  │  │      ↓                                            │  │  │
-│  │  │  tool_calls? ──Yes──→ [Act] Execute Tools         │  │  │
-│  │  │      │                 ├── Sequential              │  │  │
-│  │  │      │                 └── Concurrent (8 threads)  │  │  │
-│  │  │      │                     ↓                      │  │  │
-│  │  │      │               Append Results               │  │  │
-│  │  │      │                     ↓                      │  │  │
-│  │  │      └─────────────────→ Loop                     │  │  │
-│  │  │                                                    │  │  │
-│  │  │  No tool_calls → Final Response → Exit             │  │  │
-│  │  └────────────────────────────────────────────────────┘  │  │
-│  │                                                           │  │
-│  │  Context Compression (auto, threshold=50%)                │  │
-│  │  Provider Fallback Chain (turn-scoped)                    │  │
-│  │  Interrupt Mechanism (thread-safe, recursive)             │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │ ToolRegistry │  │ContextEngine │  │   MemoryManager    │    │
-│  │  (singleton) │  │ (compressor) │  │ (MEMORY+USER+外部) │    │
-│  └──────────────┘  └──────────────┘  └────────────────────┘    │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │              Persistence Layer                           │   │
-│  │  JSON Sessions  │  SQLite FTS5  │  JSONL Trajectories   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 十、关键文件索引
+## 附录：关键文件索引
 
 | 组件 | 文件路径 | 关键位置 |
 |------|---------|---------|
@@ -515,11 +331,4 @@ agent.interrupt(message)
 | 工具自动发现 | `tools/registry.py` | `discover_builtin_tools()` |
 | System Prompt 构建 | `agent/prompt_builder.py` | `build_skills_system_prompt()` 等 |
 | 上下文压缩 | `agent/context_compressor.py` | `ContextCompressor` 类 |
-| Prompt Caching | `agent/prompt_caching.py` | `apply_anthropic_cache_control()` |
-| 子 Agent 委派 | `tools/delegate_tool.py` | `delegate_task()` |
 | 流式 API 调用 | `run_agent.py` | `_interruptible_api_call()` |
-| 消息完整性 | `run_agent.py` | `_sanitize_api_messages()` |
-| Provider 故障转移 | `run_agent.py` | `_try_activate_fallback()` |
-| Session 持久化 | `run_agent.py` | `_persist_session()` |
-| 轨迹保存 | `agent/trajectory.py` | `save_trajectory()` |
-| 辅助 LLM 客户端 | `agent/auxiliary_client.py` | `call_llm()`, `async_call_llm()` |

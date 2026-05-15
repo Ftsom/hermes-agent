@@ -1,7 +1,5 @@
 # Hermes Agent Subagent 实现技术白皮书
 
-## TL;DR
-
 Subagent（子代理）通过 `delegate_task` 工具实现：父 Agent 在自己的工具循环中调用 `delegate_task`，运行时在**主线程构建子 `AIAgent` 实例**，再用 `ThreadPoolExecutor` 并行执行（默认上限 3 个），每个子代理拥有**独立的对话历史、独立的终端会话、隔离且受限的工具集**。父代理只看到一次工具调用 + 最终摘要，**子代理的中间工具结果与推理永远不进入父上下文**——这是 subagent 机制对上下文的核心杠杆作用。配合**深度限制（最多 1 层）、阻塞工具集（`delegate_task / clarify / memory / send_message / execute_code`）、心跳活性传播、中断级联、凭证池租约**等机制，保证了多代理协作的安全性、可观测性与成本可控。
 
 ---

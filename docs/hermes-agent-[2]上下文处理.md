@@ -1,7 +1,5 @@
 # Hermes Agent 上下文处理技术白皮书
 
-## TL;DR
-
 上下文处理贯穿每次 API 调用的全流程：调用前展开 `@` 引用、注入记忆召回、装配 System Prompt 并打缓存断点；调用后根据实际 Token 用量判断是否触发压缩；会话结束后将记忆持久化。压缩采用"头/尾保护 + 中段 LLM 摘要"策略，首次全量摘要、后续增量更新；配合 Anthropic Prompt Caching 的 `system_and_3` 断点，多轮输入 Token 成本降低约 **75%**。
 
 ---
